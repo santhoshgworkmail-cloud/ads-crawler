@@ -1,6 +1,10 @@
 import { crawlUrl } from "./crawler.js";
-import fs from "fs";
 
+/**
+ * =========================
+ * START WORKER
+ * =========================
+ */
 export async function startWorker(jobId, jobs) {
   const job = jobs.get(jobId);
   if (!job) return;
@@ -9,26 +13,61 @@ export async function startWorker(jobId, jobs) {
 
   job.status = "processing";
 
-  for (const url of job.urls) {
-    try {
-      const result = await crawlUrl(url);
-      job.results.push(result);
-    } catch (err) {
-      job.failed.push({ url, error: err.message });
-    }
+  const concurrency = 5;
+  let index = 0;
 
-    job.progress = Math.round(
-      ((job.results.length + job.failed.length) / job.urls.length) * 100
-    );
+  /**
+   * =========================
+   * WORKER LOOP
+   * =========================
+   */
+  async function worker() {
+    while (true) {
+      const i = index++;
+      if (i >= job.urls.length) break;
+
+      const item = job.urls[i];
+
+      const url = item.url;
+      const rule = item.rule || "";
+
+      try {
+        // 🔥 PASS RULE INTO CRAWLER
+        const result = await crawlUrl(url, rule);
+
+        const enriched = {
+          url,
+          rule,
+          ...result
+        };
+
+        if (result.ok) {
+          job.results.push(enriched);
+        } else {
+          job.failed.push(enriched);
+        }
+
+        // update progress
+        job.progress = Math.round(
+          ((job.results.length + job.failed.length) / job.urls.length) * 100
+        );
+      } catch (err) {
+        job.failed.push({
+          url,
+          rule,
+          ok: false,
+          error: err.message
+        });
+      }
+    }
   }
+
+  // run workers in parallel
+  await Promise.all(
+    Array.from({ length: concurrency }, () => worker())
+  );
 
   job.status = "completed";
 
-  // save result file
-  fs.writeFileSync(
-    `results/${jobId}.json`,
-    JSON.stringify(job, null, 2)
-  );
-
-  console.log("🏁 Worker finished:", jobId);
+  console.log("✅ Worker finished:", jobId);
 }

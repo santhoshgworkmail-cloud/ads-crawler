@@ -1,11 +1,29 @@
 import axios from "axios";
 
-// 👉 CHANGE THIS anytime you want different matching rules
-const TARGET_LINES = [
-  "adagio.io, 1370, RESELLER"
-];
+/**
+ * =========================
+ * SMART ADS.TXT CRAWLER
+ * =========================
+ * Now supports dynamic rule per URL
+ */
 
-export async function crawlUrl(url) {
+/**
+ * Parse rule string into clean searchable line
+ * Example:
+ * "adagio.io, 1370, RESELLER"
+ */
+function normalizeRule(rule = "") {
+  return rule
+    .split(",")
+    .map(r => r.trim())
+    .filter(Boolean)
+    .join(", ");
+}
+
+/**
+ * MAIN CRAWL FUNCTION
+ */
+export async function crawlUrl(url, rule = "") {
   try {
     const adsTxtUrl = url.replace(/\/$/, "") + "/ads.txt";
 
@@ -13,31 +31,52 @@ export async function crawlUrl(url) {
       timeout: 10000
     });
 
-    const content = res.data;
+    const content = res.data || "";
+
+    const targetLine = normalizeRule(rule);
 
     const found = [];
     const missing = [];
 
-    for (const line of TARGET_LINES) {
-      if (content.includes(line)) {
-        found.push(line);
-      } else {
-        missing.push(line);
-      }
+    // If no rule provided → return safe fallback
+    if (!targetLine) {
+      return {
+        url,
+        adsTxtUrl,
+        ok: true,
+        found: [],
+        missing: [],
+        note: "No rule provided"
+      };
+    }
+
+    /**
+     * =========================
+     * MATCHING LOGIC
+     * =========================
+     * We use "includes" for flexibility
+     */
+    if (content.includes(targetLine)) {
+      found.push(targetLine);
+    } else {
+      missing.push(targetLine);
     }
 
     return {
       url,
       adsTxtUrl,
-      ok: true,
+      ok: missing.length === 0,
       found,
       missing
     };
+
   } catch (err) {
     return {
       url,
       ok: false,
-      error: err.message
+      error: err.message,
+      found: [],
+      missing: rule ? [rule] : []
     };
   }
 }
