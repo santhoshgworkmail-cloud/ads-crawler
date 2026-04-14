@@ -2,95 +2,98 @@ import express from "express";
 import multer from "multer";
 import fs from "fs";
 import { randomUUID } from "crypto";
-import { startWorker } from "./worker.js";
+import { Queue, QueueEvents } from "bullmq";
+import IORedis from "ioredis";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-console.log("🔥 SERVER BOOTING...");
+console.log("🔥 SERVER STARTED");
 
+// -------------------- REDIS --------------------
+const connection = new IORedis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null
+});
+
+// -------------------- QUEUE --------------------
+const crawlQueue = new Queue("crawlQueue", { connection });
+const queueEvents = new QueueEvents("crawlQueue", { connection });
+
+// -------------------- STORAGE (simple tracking) --------------------
 const jobs = new Map();
 
-// file upload config
+// -------------------- UPLOAD --------------------
 const upload = multer({ dest: "uploads/" });
 
-/**
- * =========================
- * 🌐 UI DASHBOARD
- * =========================
- */
+// -------------------- UI --------------------
 app.get("/ui", (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Ads Crawler</title>
-  <style>
-    body { font-family: Arial; max-width: 650px; margin: 40px auto; }
-    button { padding: 10px; margin-top: 10px; cursor: pointer; }
-    input { margin: 10px 0; }
-    a { display:inline-block; margin-bottom:10px; }
-    #status { margin-top: 20px; padding: 10px; background: #f4f4f4; }
-  </style>
+<title>Crawler Queue SaaS</title>
+<style>
+body { font-family: Arial; max-width: 900px; margin: 30px auto; background:#f6f7fb; }
+.card { background:white; padding:15px; margin:10px 0; border-radius:10px; }
+button { padding:10px; background:#111; color:white; border:none; border-radius:8px; }
+table { width:100%; background:white; border-collapse:collapse; }
+th,td{padding:8px;border-bottom:1px solid #eee;font-size:13px;}
+</style>
 </head>
 <body>
 
-<h2>🚀 Ads.txt Crawler</h2>
+<div class="card">
+<h3>🚀 Queue Crawler</h3>
+</div>
 
-<a href="/template">📥 Download Sample Template</a>
+<div class="card">
+<input type="file" id="file"/>
+<button onclick="upload()">Upload</button>
+</div>
 
-<br/>
-
-<input type="file" id="file" />
-<br />
-<button onclick="upload()">Upload & Start Crawl</button>
-
-<div id="status"></div>
+<div class="card">
+<table>
+<thead>
+<tr><th>URL</th><th>Status</th></tr>
+</thead>
+<tbody id="table"></tbody>
+</table>
+</div>
 
 <script>
 let jobId = null;
+let results = [];
 
-async function upload() {
-  const file = document.getElementById('file').files[0];
+async function upload(){
+  const file = document.getElementById("file").files[0];
+  const fd = new FormData();
+  fd.append("file", file);
 
-  if (!file) {
-    alert("Please select a file first");
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append('file', file);
-
-  const res = await fetch('/upload', {
-    method: 'POST',
-    body: formData
-  });
-
+  const res = await fetch("/upload",{method:"POST",body:fd});
   const data = await res.json();
   jobId = data.jobId;
-
-  document.getElementById('status').innerHTML =
-    "🚀 Job started: " + jobId;
 
   poll();
 }
 
-async function poll() {
-  if (!jobId) return;
-
-  const res = await fetch('/status/' + jobId);
+async function poll(){
+  const res = await fetch("/status/"+jobId);
   const data = await res.json();
 
-  document.getElementById('status').innerHTML =
-    "<b>Status:</b> " + data.status + "<br>" +
-    "<b>Progress:</b> " + data.progress + "%<br>" +
-    "<b>Done:</b> " + data.results.length + " | Failed: " + data.failed.length;
+  results = data.results || [];
+  let html = "";
 
-  if (data.status !== "completed") {
+  results.forEach(r=>{
+    html += "<tr><td>" + r.url + "</td><td>" + (r.ok ? "FOUND" : "MISSING") + "</td></tr>";
+  });
+
+  document.getElementById("table").innerHTML = html;
+
+  if(data.status !== "completed"){
     setTimeout(poll, 2000);
-  } else {
-    document.getElementById('status').innerHTML +=
-      "<br><br><a href='/download/" + jobId + "'>⬇ Download Results</a>";
   }
 }
 </script>
@@ -100,133 +103,66 @@ async function poll() {
   `);
 });
 
-/**
- * =========================
- * TEMPLATE DOWNLOAD
- * =========================
- */
-app.get("/template", (req, res) => {
-  const csv =
-`url,ads_txt_line
-https://example.com,adagio.io, 1370, RESELLER
-https://google.com,google.com, DIRECT
-`;
+// -------------------- UPLOAD -> QUEUE --------------------
+app.post("/upload", upload.single("file"), async (req, res) => {
+  const content = fs.readFileSync(req.file.path, "utf-8");
 
-  const filePath = "template.csv";
-  fs.writeFileSync(filePath, csv);
+  const urls = content
+    .split("\n")
+    .map(u => u.trim())
+    .filter(Boolean);
 
-  res.download(filePath);
-});
+  const jobId = randomUUID();
 
-/**
- * =========================
- * HEALTH CHECK
- * =========================
- */
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "Ads crawler running" });
-});
+  jobs.set(jobId, {
+    id: jobId,
+    status: "queued",
+    results: [],
+    total: urls.length,
+    done: 0
+  });
 
-/**
- * =========================
- * UPLOAD CSV (URL + RULE)
- * =========================
- */
-app.post("/upload", upload.single("file"), (req, res) => {
-  try {
-    const filePath = req.file.path;
-    const content = fs.readFileSync(filePath, "utf-8");
+  const targetLines = ["adagio.io, 1370, RESELLER"];
 
-    const lines = content.split("\n").filter(Boolean);
-
-    const urls = [];
-
-    for (let i = 1; i < lines.length; i++) {
-      const parts = lines[i].split(",");
-
-      const url = parts[0]?.trim();
-      const rule = parts.slice(1).join(",").trim(); // important fix
-
-      if (url) {
-        urls.push({ url, rule });
-      }
-    }
-
-    const jobId = randomUUID();
-
-    jobs.set(jobId, {
-      id: jobId,
-      urls,
-      status: "queued",
-      results: [],
-      failed: [],
-      progress: 0
-    });
-
-    setImmediate(() => {
-      startWorker(jobId, jobs);
-    });
-
-    res.json({
+  // enqueue all URLs
+  for (const url of urls) {
+    await crawlQueue.add("crawl", {
       jobId,
-      totalUrls: urls.length,
-      status: "queued"
+      url,
+      targetLines
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
+
+  res.json({ jobId, total: urls.length });
 });
 
-/**
- * =========================
- * STATUS
- * =========================
- */
+// -------------------- RECEIVE RESULTS --------------------
+queueEvents.on("completed", ({ jobId: bullJobId, returnvalue }) => {
+  const data = returnvalue;
+  if (!data) return;
+
+  const job = jobs.get(data.jobId);
+  if (!job) return;
+
+  job.results.push(data);
+  job.done++;
+
+  if (job.done === job.total) {
+    job.status = "completed";
+  }
+
+  jobs.set(data.jobId, job);
+});
+
+// -------------------- STATUS --------------------
 app.get("/status/:id", (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: "not found" });
-
+  if (!job) return res.status(404).send("not found");
   res.json(job);
 });
 
-/**
- * =========================
- * DOWNLOAD CSV RESULT
- * =========================
- */
-app.get("/download/:id", (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: "not found" });
-
-  const header = "url,rule,adsTxtUrl,status,found,missing,error\n";
-
-  const rows = job.results.map(r => {
-    return [
-      r.url || "",
-      r.rule || "",
-      r.adsTxtUrl || "",
-      r.ok ? "ok" : "failed",
-      (r.found || []).join("|"),
-      (r.missing || []).join("|"),
-      r.error || ""
-    ].join(",");
-  });
-
-  const csv = header + rows.join("\n");
-
-  const filePath = `results/${req.params.id}.csv`;
-  fs.writeFileSync(filePath, csv);
-
-  res.download(filePath);
-});
-
-/**
- * =========================
- * RENDER SAFE PORT
- * =========================
- */
+// -------------------- START --------------------
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
+  console.log("🚀 API running on port", PORT);
 });

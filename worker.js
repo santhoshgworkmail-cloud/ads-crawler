@@ -2,7 +2,7 @@ import { crawlUrl } from "./crawler.js";
 
 /**
  * =========================
- * START WORKER
+ * START WORKER (CLEAN VERSION)
  * =========================
  */
 export async function startWorker(jobId, jobs) {
@@ -28,11 +28,11 @@ export async function startWorker(jobId, jobs) {
 
       const item = job.urls[i];
 
-      const url = item.url;
-      const rule = item.rule || "";
+      // support both formats safely
+      const url = typeof item === "string" ? item : item.url;
+      const rule = typeof item === "string" ? "" : (item.rule || "");
 
       try {
-        // 🔥 PASS RULE INTO CRAWLER
         const result = await crawlUrl(url, rule);
 
         const enriched = {
@@ -47,17 +47,22 @@ export async function startWorker(jobId, jobs) {
           job.failed.push(enriched);
         }
 
-        // update progress
-        job.progress = Math.round(
-          ((job.results.length + job.failed.length) / job.urls.length) * 100
-        );
+        // FIXED: correct progress calculation (no duplication bug)
+        const done = job.results.length + job.failed.length;
+        job.progress = Math.round((done / job.urls.length) * 100);
+
       } catch (err) {
-        job.failed.push({
+        const failedItem = {
           url,
           rule,
           ok: false,
           error: err.message
-        });
+        };
+
+        job.failed.push(failedItem);
+
+        const done = job.results.length + job.failed.length;
+        job.progress = Math.round((done / job.urls.length) * 100);
       }
     }
   }
